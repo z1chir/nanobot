@@ -5,6 +5,7 @@ import html
 import imaplib
 import re
 import smtplib
+import socket
 import ssl
 from datetime import date
 from email import policy
@@ -21,6 +22,102 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Base
+from nanobot.utils.proxy import create_proxy_socket
+
+
+class _ProxiedIMAP4(imaplib.IMAP4):
+    """IMAP4 client that connects through a proxy."""
+
+    def __init__(self, host: str, port: int, proxy_url: str, timeout: float = 30.0):
+        self._proxy_url = proxy_url
+        self._timeout = timeout
+        super().__init__(host, port)
+
+    def _create_socket(self, timeout: float | None) -> socket.socket:
+        effective_timeout = timeout if timeout is not None else self._timeout
+        return create_proxy_socket(
+            self._proxy_url,
+            self.host,
+            self.port,
+            timeout=effective_timeout,
+        )
+
+
+class _ProxiedIMAP4SSL(imaplib.IMAP4_SSL):
+    """IMAP4_SSL client that connects through a proxy."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        proxy_url: str,
+        ssl_context: ssl.SSLContext | None = None,
+        timeout: float = 30.0,
+    ):
+        self._proxy_url = proxy_url
+        self._timeout = timeout
+        super().__init__(host, port, ssl_context=ssl_context)
+
+    def _create_socket(self, timeout: float | None) -> socket.socket:
+        effective_timeout = timeout if timeout is not None else self._timeout
+        sock = create_proxy_socket(
+            self._proxy_url,
+            self.host,
+            self.port,
+            timeout=effective_timeout,
+        )
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _ProxiedSMTP(smtplib.SMTP):
+    """SMTP client that connects through a proxy."""
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = 0,
+        proxy_url: str = "",
+        timeout: float = 30.0,
+        **kwargs: Any,
+    ):
+        self._proxy_url = proxy_url
+        super().__init__(host, port, timeout=timeout, **kwargs)
+
+    def _get_socket(self, host: str, port: int, timeout: float | None) -> socket.socket:
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+        return create_proxy_socket(
+            self._proxy_url,
+            host,
+            port,
+            timeout=timeout if timeout is not None else 30.0,
+        )
+
+
+class _ProxiedSMTP_SSL(smtplib.SMTP_SSL):
+    """SMTP_SSL client that connects through a proxy."""
+
+    def __init__(
+        self,
+        host: str = "",
+        port: int = 0,
+        proxy_url: str = "",
+        timeout: float = 30.0,
+        **kwargs: Any,
+    ):
+        self._proxy_url = proxy_url
+        super().__init__(host, port, timeout=timeout, **kwargs)
+
+    def _get_socket(self, host: str, port: int, timeout: float | None) -> socket.socket:
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+        sock = create_proxy_socket(
+            self._proxy_url,
+            host,
+            port,
+            timeout=timeout if timeout is not None else 30.0,
+        )
+        return self.context.wrap_socket(sock, server_hostname=host)
 
 
 class EmailConfig(Base):
@@ -35,6 +132,7 @@ class EmailConfig(Base):
     imap_password: str = ""
     imap_mailbox: str = "INBOX"
     imap_use_ssl: bool = True
+    imap_proxy: str | None = None  # HTTP/SOCKS5 proxy for IMAP, e.g. "socks5://127.0.0.1:1080"
 
     smtp_host: str = ""
     smtp_port: int = 587
@@ -42,6 +140,7 @@ class EmailConfig(Base):
     smtp_password: str = ""
     smtp_use_tls: bool = True
     smtp_use_ssl: bool = False
+    smtp_proxy: str | None = None  # HTTP/SOCKS5 proxy for SMTP, e.g. "http://127.0.0.1:7890"
     from_address: str = ""
 
     auto_reply_enabled: bool = True
@@ -171,7 +270,9 @@ class EmailChannel(BaseChannel):
                 subject = override
 
         email_msg = EmailMessage()
-        email_msg["From"] = self.config.from_address or self.config.smtp_username or self.config.imap_username
+        email_msg["From"] = (
+            self.config.from_address or self.config.smtp_username or self.config.imap_username
+        )
         email_msg["To"] = to_addr
         email_msg["Subject"] = subject
         email_msg.set_content(msg.content or "")
@@ -203,23 +304,44 @@ class EmailChannel(BaseChannel):
             missing.append("smtp_password")
 
         if missing:
-            logger.error("Email channel not configured, missing: {}", ', '.join(missing))
+            logger.error("Email channel not configured, missing: {}", ", ".join(missing))
             return False
         return True
 
     def _smtp_send(self, msg: EmailMessage) -> None:
         timeout = 30
+        proxy = self.config.smtp_proxy
         if self.config.smtp_use_ssl:
-            with smtplib.SMTP_SSL(
-                self.config.smtp_host,
-                self.config.smtp_port,
-                timeout=timeout,
-            ) as smtp:
+            if proxy:
+                client_cls = _ProxiedSMTP_SSL
+                smtp = client_cls(
+                    self.config.smtp_host,
+                    self.config.smtp_port,
+                    proxy_url=proxy,
+                    timeout=timeout,
+                )
+            else:
+                smtp = smtplib.SMTP_SSL(
+                    self.config.smtp_host,
+                    self.config.smtp_port,
+                    timeout=timeout,
+                )
+            with smtp:
                 smtp.login(self.config.smtp_username, self.config.smtp_password)
                 smtp.send_message(msg)
             return
 
-        with smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=timeout) as smtp:
+        if proxy:
+            client_cls = _ProxiedSMTP
+            smtp = client_cls(
+                self.config.smtp_host,
+                self.config.smtp_port,
+                proxy_url=proxy,
+                timeout=timeout,
+            )
+        else:
+            smtp = smtplib.SMTP(self.config.smtp_host, self.config.smtp_port, timeout=timeout)
+        with smtp:
             if self.config.smtp_use_tls:
                 smtp.starttls(context=ssl.create_default_context())
             smtp.login(self.config.smtp_username, self.config.smtp_password)
@@ -271,10 +393,25 @@ class EmailChannel(BaseChannel):
         messages: list[dict[str, Any]] = []
         mailbox = self.config.imap_mailbox or "INBOX"
 
+        proxy = self.config.imap_proxy
         if self.config.imap_use_ssl:
-            client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
+            if proxy:
+                client = _ProxiedIMAP4SSL(
+                    self.config.imap_host,
+                    self.config.imap_port,
+                    proxy_url=proxy,
+                )
+            else:
+                client = imaplib.IMAP4_SSL(self.config.imap_host, self.config.imap_port)
         else:
-            client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
+            if proxy:
+                client = _ProxiedIMAP4(
+                    self.config.imap_host,
+                    self.config.imap_port,
+                    proxy_url=proxy,
+                )
+            else:
+                client = imaplib.IMAP4(self.config.imap_host, self.config.imap_port)
 
         try:
             client.login(self.config.imap_username, self.config.imap_password)
@@ -346,7 +483,9 @@ class EmailChannel(BaseChannel):
                     # mark_seen is the primary dedup; this set is a safety net
                     if len(self._processed_uids) > self._MAX_PROCESSED_UIDS:
                         # Evict a random half to cap memory; mark_seen is the primary dedup
-                        self._processed_uids = set(list(self._processed_uids)[len(self._processed_uids) // 2:])
+                        self._processed_uids = set(
+                            list(self._processed_uids)[len(self._processed_uids) // 2 :]
+                        )
 
                 if mark_seen:
                     client.store(imap_id, "+FLAGS", "\\Seen")
@@ -367,7 +506,11 @@ class EmailChannel(BaseChannel):
     @staticmethod
     def _extract_message_bytes(fetched: list[Any]) -> bytes | None:
         for item in fetched:
-            if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[1], (bytes, bytearray)):
+            if (
+                isinstance(item, tuple)
+                and len(item) >= 2
+                and isinstance(item[1], (bytes, bytearray))
+            ):
                 return bytes(item[1])
         return None
 
